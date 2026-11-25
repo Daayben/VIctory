@@ -435,6 +435,91 @@ fn record_clamp_as(
     true
 }
 
+/// Whether the clamps of a run of indirect draws are recorded in a list of
+/// their own that runs before the list that draws
+/// (`VICTORY_HOIST_CLAMPS=1`; off by default), so that the draws are not
+/// interleaved with our dispatches and their barriers. Each clamp waits for
+/// the one before it (a barrier between them), so that the list's budget is
+/// charged in the order of the draws, as when each clamp precedes its draw:
+/// without that, whole mesh objects flickered where records past the budget
+/// were not the same ones from frame to frame (Belobug's mode 7).
+/// It needs lists cut into parts (`crate::queue::cuts`): the clamps are a
+/// part of the title's list, before the part that draws.
+///
+/// After Belobug/VIctory-Belobug-AMD (beloooo, `VICTORY_HOIST_CLAMPS`):
+/// measured there at one place in the world, 225 to about 80 ms of GPU
+/// time a frame. Not measured on this tree yet.
+pub(crate) fn hoisting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_HOIST_CLAMPS").is_some_and(|v| v == "1");
+        if asked && !crate::queue::cuts() {
+            tracing::warn!("VICTORY_HOIST_CLAMPS=1 needs lists cut at their waits (VICTORY_CUT_WAITS): left off");
+        }
+        asked && crate::queue::cuts()
+    })
+}
+
+/// As [`bound`], recorded in `clamps`, a list that runs before the one that
+/// executes: the buffer and the offset of the clamped records, readable as
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    // SAFETY: live buffers.
+    let (src_base, count_base) = unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
+    // Addresses the shader's offsets (32 bits) reach, as in `record_clamp_as`.
+    let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX));
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => (base, 1u32, off as u32),
+        (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers. Only
+    // clamps record compute state in `clamps` once they began, and they all
+    // bind the same signature, pipeline and budget (romainhedouin, Belobug
+    // pull request #28).
+    unsafe {
+        if clamps.clamp_unbound() {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+        }
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        // One clamp after another: the budget is charged in draw order.
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    Some((dst, at))
+}
+
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
@@ -1401,6 +1486,106 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// Clamps hoisted into a list of their own (`bound_before`) leave, for
+    /// the list after it, the same records the clamp in place leaves in the
+    /// scratch buffer (`bound`): the same clamping, the same budget charged
+    /// in the same order. Two runs of records share one buffer of the list
+    /// of clamps, the second 16-byte aligned after the first.
+    #[test]
+    fn hoisted_clamps_match_the_clamps_in_place() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (Ok(clamps), Ok(reader), Ok(inline)) = (host.new_list(), host.new_list(), host.new_list()) else {
+            return;
+        };
+        const KIND_INDEXED: u32 = 1;
+        const STRIDE: u32 = 20;
+        const RECORDS: u32 = 3;
+        let bytes = u64::from(STRIDE * RECORDS);
+        let (Some((src, src_ptr)), Some((hoisted_out, hoisted_ptr)), Some((inline_out, inline_ptr))) =
+            (host.shared_buffer(256), host.shared_buffer(256), host.shared_buffer(256))
+        else {
+            return;
+        };
+        // An ordinary record, one that asks for everything (clamped), and
+        // one with offsets to keep; the second run starts at the second.
+        let records: [[u32; 5]; RECORDS as usize] =
+            [[3, 1, 0, 0, 0], [0xFFFF_FFFF, 0xFFFF_FFFF, 7, 0, 0], [6, 2, 3, 1, 4]];
+        // SAFETY: mapped host buffers of 256 bytes.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, 256);
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), src_ptr, bytes as usize);
+            std::ptr::write_bytes(hoisted_ptr, 0xCC, 256);
+            std::ptr::write_bytes(inline_ptr, 0xCC, 256);
+        }
+
+        let (first, at_first) = bound_before(&clamps, (&src, 0), None, (KIND_INDEXED, STRIDE, RECORDS)).unwrap();
+        let (second, at_second) =
+            bound_before(&clamps, (&src, u64::from(STRIDE)), None, (KIND_INDEXED, STRIDE, RECORDS - 1)).unwrap();
+        assert_eq!(first.as_raw(), second.as_raw(), "both runs fit one buffer");
+        assert_eq!((at_first, at_second), (0, bytes.next_multiple_of(16)));
+        clamps.clamp_end();
+        clamps.close();
+        // The list after reads them as arguments; copied out here.
+        // SAFETY: an open list; live buffers in the states named.
+        unsafe {
+            reader.list.ResourceBarrier(&[transition(
+                &first,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            reader.list.CopyBufferRegion(&hoisted_out, 0, &first, 0, at_second + u64::from(STRIDE * (RECORDS - 1)));
+        }
+        reader.close();
+
+        // In place: the same two runs, each into the scratch buffer at 0.
+        let copy_out = |at: u64, of: u64| {
+            let scratch = bound(&inline, (&src, of), None, (KIND_INDEXED, STRIDE, RECORDS - (of / u64::from(STRIDE)) as u32)).unwrap();
+            // SAFETY: an open list; the scratch buffer in INDIRECT_ARGUMENT.
+            unsafe {
+                inline.list.ResourceBarrier(&[transition(
+                    &scratch,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                inline.list.CopyBufferRegion(&inline_out, at, &scratch, 0, u64::from(STRIDE) * (RECORDS as u64 - of / u64::from(STRIDE)));
+                inline.list.ResourceBarrier(&[transition(
+                    &scratch,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        };
+        copy_out(0, 0);
+        copy_out(at_second, u64::from(STRIDE));
+        inline.close();
+
+        host.execute(&[&clamps, &reader]);
+        host.execute(&[&inline]);
+
+        let words = |ptr: *mut u8, at: u64, n: u32| {
+            // SAFETY: mapped host buffers the finished lists wrote.
+            unsafe { std::slice::from_raw_parts(ptr.add(at as usize).cast::<u32>().cast_const(), (n * STRIDE / 4) as usize).to_vec() }
+        };
+        let hoisted = [words(hoisted_ptr, 0, RECORDS), words(hoisted_ptr, at_second, RECORDS - 1)];
+        let in_place = [words(inline_ptr, 0, RECORDS), words(inline_ptr, at_second, RECORDS - 1)];
+        assert_eq!(hoisted, in_place, "hoisted clamps must leave what the clamps in place leave");
+        // The ordinary record is kept as it was, and the one that asked for
+        // everything does not survive as written. Clamped twice, it spends
+        // the list's budget: the last record runs in the first run and
+        // empty, offsets kept, in the second, as the budget is charged in
+        // the order of the runs.
+        assert_eq!(&hoisted[0][..5], &records[0]);
+        assert_ne!(&hoisted[0][5..10], &records[1]);
+        assert_eq!(&hoisted[0][10..15], &records[2]);
+        assert_eq!(&hoisted[1][5..10], &[0, 0, 3, 1, 4]);
+
+        for list in [&clamps, &reader, &inline] {
+            list.reset();
+        }
     }
 }
 

@@ -1018,6 +1018,11 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        // A draw whose shaders store may write the arguments of what
+        // follows (`crate::indirect::hoisting`).
+        if p.stages.iter().any(|stage| stage.translated().stores) {
+            list.count_write();
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -2339,6 +2344,8 @@ impl State {
         if builder {
             crate::pipeline::builder_recorded(self.pipeline as This, false);
         }
+        // It may write the arguments of what follows.
+        list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3187,14 +3194,17 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    /// `clamps`: the list before `list` that holds the clamps of its
+    /// indirect draws, if they are hoisted (`crate::indirect::hoisting`).
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
+        clamps: Option<&HostList>,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        let ran = self.run_indirect(list, clamps, (kind, stride, max), arguments, count);
         if kind == 2 && max != 0 && crate::pipeline::is_builder(self.pipeline as This) {
             if !ran {
                 crate::pipeline::builder_off("an indirect builder dispatch could not run");
@@ -3247,6 +3257,7 @@ impl State {
     fn run_indirect(
         &mut self,
         list: &HostList,
+        clamps: Option<&HostList>,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
@@ -3370,9 +3381,30 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match hit {
-            Some(hit) => hit,
-            None => {
+        // Draws of a run: clamped in the list before, which the run's first
+        // draw opened (`crate::list`), so that nothing of ours comes between
+        // the draws. Not for windows or dispatches in parts, which have
+        // their own scratch layout.
+        let hoisted = clamps
+            .filter(|_| hit.is_none() && !windowed && parts.is_none() && kind != DISPATCH)
+            .and_then(|clamps| {
+                args.refresh(clamps, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(clamps, *at, 4);
+                }
+                #[cfg(feature = "diagnostics")]
+                clamps.note_op(|| format!("hoisted clamp of kind {kind}"));
+                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                crate::indirect::bound_before(clamps, (&args.buffer, offset), count_arg, (kind, stride, max))
+            });
+        let inline = hoisted.is_none();
+        if !inline {
+            self.window = None;
+        }
+        let (bounded, at) = match (hoisted, hit) {
+            (Some(hoisted), _) => hoisted,
+            (None, Some(hit)) => hit,
+            (None, None) => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -3438,7 +3470,10 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            // (Hoisted arguments stay as the list of clamps left them.)
+            if inline {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3487,8 +3522,12 @@ impl State {
             let name = crate::pipeline::shaders_of(self.pipeline as This);
             crate::capture::read_indirect(list, crate::capture::Records::Clamped(&bounded, at), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &bounded);
+        if inline {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
+            // It may write the arguments of what follows.
+            list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

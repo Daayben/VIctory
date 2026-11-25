@@ -449,15 +449,41 @@ fn record_clamp_as(
 /// After Belobug/VIctory-Belobug-AMD (beloooo, `VICTORY_HOIST_CLAMPS`):
 /// measured there at one place in the world, 225 to about 80 ms of GPU
 /// time a frame. Not measured on this tree yet.
+///
+/// `VICTORY_HOIST_CLAMPS=alt`: on for twenty seconds, off for twenty, and
+/// so on, each change said in the log, so that one run in one scene
+/// measures both (after victory-fork's `=alt` switches). A hoist under way
+/// when it goes off ends as it would have.
 pub(crate) fn hoisting() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let asked = std::env::var_os("VICTORY_HOIST_CLAMPS").is_some_and(|v| v == "1");
-        if asked && !crate::queue::cuts() {
-            tracing::warn!("VICTORY_HOIST_CLAMPS=1 needs lists cut at their waits (VICTORY_CUT_WAITS): left off");
+    /// 0 off, 1 on, 2 alternating.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_HOIST_CLAMPS").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if asked != 0 && !crate::queue::cuts() {
+            tracing::warn!("VICTORY_HOIST_CLAMPS needs lists cut at their waits (VICTORY_CUT_WAITS): left off");
+            return 0;
         }
-        asked && crate::queue::cuts()
-    })
+        asked
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static PHASE: AtomicU64 = AtomicU64::new(u64::MAX);
+            let phase = START.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20;
+            let on = phase.is_multiple_of(2);
+            if PHASE.swap(phase, Ordering::Relaxed) != phase {
+                tracing::info!(on, "clamps of indirect draws hoisted (VICTORY_HOIST_CLAMPS=alt)");
+            }
+            on
+        }
+    }
 }
 
 /// As [`bound`], recorded in `clamps`, a list that runs before the one that
